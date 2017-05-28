@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -31,7 +32,15 @@ void start_process(process *proc, int rfd, int wfd) {
         proc->pid    = pid;
 
         // make program group in one job
-        if(setpgid(pid, proc->parent_job->pgid ? proc->parent_job->pgid : pid)) perror("setpgid");
+        int stat;
+        if((stat = setpgid(pid, proc->parent_job->pgid ? proc->parent_job->pgid : pid))) {
+           if(stat == ESRCH) {
+               proc->parent_job->pgid = pid;
+               if(setpgid(pid, proc->parent_job->pgid))
+                   perror("setpgid");
+           } else
+               perror("setpgid");
+        }
     } else {
         // child
 

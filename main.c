@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <errno.h>
 
 #include "print.h"
 #include "parse.h"
@@ -12,16 +13,16 @@
 #include "signals.h"
 #include "commands.h"
 
-volatile job_list *running_job_list = NULL;
-volatile job_list *freeing_job_list = NULL;
+job_list *running_job_list = NULL;
+job_list *freeing_job_list = NULL;
 job *job_fg = NULL;
 
-void sigchld_handler(int signo) {
+void wait_children() {
     while(1) {
         pid_t pid;
         int wstatus;
         if((pid = waitpid(-1, &wstatus, WNOHANG | WUNTRACED | WCONTINUED)) == -1) {
-            //perror("waitpid");
+            if(errno != ECHILD) perror("waitpid");
             return;
         }
 
@@ -63,7 +64,10 @@ FOUND:
 }
 
 void wait_fgjob(void) {
+    block_sigchld();
     while(job_fg) {
+        sigset_t ss;
+        int sig;
         char stop = 0;
         process *cur_proc;
         for(cur_proc = job_fg->process_list; cur_proc; cur_proc = cur_proc->next) {
@@ -76,18 +80,18 @@ void wait_fgjob(void) {
         if(stop) job_fg = NULL;
         break;
 CONT:
-        unblock_sigchld();
-        // while here, SIGCHLD handler updates processes' status
-        // according to `man 7 signal`, this sleep will be interupted by SIGCHLD regardless of SA_RESTART 
-        sleep(1);
-        block_sigchld();
+        // wait for any signals including SIGCHLD
+        sigemptyset(&ss);
+        sigaddset(&ss, SIGCHLD);
+        if(sigwait(&ss, &sig)) perror("sigwait");
+        wait_children();
     }
+    unblock_sigchld();
 }
 
 void free_freeingjobs(void) {
     int first = 1;
 
-    // free is not async-signal-safe, so shikata-ga-nai.
     while(freeing_job_list) {
         if(freeing_job_list->job == job_fg)
             job_fg = NULL;
@@ -115,21 +119,23 @@ int main(int argc, char *argv[]) {
     char s[LINELEN];
     job *curr_job;
 
-    // these funcs are in `commands.c`
-    struct command commands[] = {
+    // these funcs are in `commands.c'
+    const struct command commands[] = {
         {.name = "jobs"   , .func = command_jobs   },
         {.name = "fg"     , .func = command_fg     },
         {.name = "bg"     , .func = command_bg     },
         {.name = "cd"     , .func = command_cd     },
-        {NULL, NULL},
+        {NULL, NULL}, // don't forget this line, which indicates tail.
     };
 
     ignore_stop_signals();
-    handle_sigchld(sigchld_handler);
 
     char first_exit = 1;
 
     while(get_line(s, LINELEN)) {
+
+        wait_children();
+
         if(!strcmp(s, "exit\n")) {
             if(!running_job_list || !first_exit) break;
 
@@ -146,10 +152,8 @@ int main(int argc, char *argv[]) {
         curr_job = parse_line(s);
         if(!curr_job) continue;
 
-        block_sigchld();
-
         // built-in commands
-        for(struct command *com = commands; com->name; com++) {
+        for(const struct command *com = commands; com->name; com++) {
             if(!strcmp(curr_job->process_list->program_name, com->name)) {
                 com->func(curr_job->process_list->argument_list);
                 goto EPILOGUE;
@@ -188,10 +192,9 @@ EPILOGUE:
 
         puts("");
 
-        // SIGCHLD handler made list of already terminating jobs
+        wait_children();
         free_freeingjobs();
 
-        unblock_sigchld();
     }
 
     return 0;
